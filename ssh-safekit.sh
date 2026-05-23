@@ -1215,6 +1215,7 @@ print_banner() {
 ${BOLD}${BLUE}
 ============================================================
    ssh-safekit  v${VERSION}   -  Linux SSH 安全加固工具
+   【开源地址】 https://github.com/DsureD/ssh-safekit
 ============================================================
 ${RESET}
 EOF
