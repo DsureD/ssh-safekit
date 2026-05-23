@@ -91,8 +91,6 @@ wget -qO ssh-safekit.sh https://raw.githubusercontent.com/DsureD/ssh-safekit/mai
 
 ### 一行命令直接执行
 
-如果你信任脚本内容，可以直接管道执行：
-
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh)
 ```
