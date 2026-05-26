@@ -2,17 +2,18 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Linux 服务器 SSH 安全一键加固脚本。交互式菜单操作，兼容 Debian/Ubuntu 和 RHEL/CentOS/Rocky/AlmaLinux/Fedora。
+Linux 服务器 SSH 安全一键加固脚本。交互式菜单操作，广泛兼容主流 Linux 发行版。
 
 ## 功能
 
-- **SSH 配置管理** — Root 登录策略、密码认证开关、端口修改（自定义/随机高位端口）、认证限制
+- **SSH 配置管理** — Root 登录策略、密码认证开关、端口修改（自定义/随机高位端口）、认证限制、空闲超时、root 密码管理
 - **SSH 密钥管理** — 服务器端生成密钥对（ed25519/RSA 4096）、导入已有公钥
 - **Fail2ban** — 一键安装、配置 SSH 防暴力破解规则、解封 IP
 - **防火墙** — 自适应 ufw（Debian 系）/ firewalld（RHEL 系），IPv4+IPv6 双栈
 - **一键推荐加固** — 7 步引导式加固流程，每步可跳过
 - **安全状态总览** — 一键查看 SSH、防火墙、Fail2ban、监听端口等状态
 - **配置还原** — 从自动备份中恢复 SSH 配置
+- **CLI 参数** — 支持 `--status`、`--quick` 等非交互模式
 
 ## 菜单结构
 
@@ -23,7 +24,9 @@ ssh-safekit 主菜单
 │   ├── 2) 密码认证开关 (启用 / 禁用，带公钥检查)
 │   ├── 3) 修改 SSH 端口 (自定义 / 随机高位 / 恢复22)
 │   ├── 4) 认证限制 (MaxAuthTries / LoginGraceTime)
-│   ├── 5) 锁定 root 密码 (passwd -l)
+│   ├── 5) 空闲超时 (ClientAliveInterval / ClientAliveCountMax)
+│   ├── 6) 修改 root 密码 (passwd)
+│   ├── 7) 锁定 root 密码 (passwd -l)
 │   └── 0) 返回主菜单
 ├── 2) SSH 密钥管理
 │   ├── 1) 生成新密钥对 (ed25519 / RSA 4096)
@@ -54,7 +57,7 @@ ssh-safekit 主菜单
 │   └── 步骤 7. 限制 root 登录 + 锁定 root 密码
 ├── 6) 查看当前安全状态
 │   ├── 系统信息
-│   ├── SSH 配置
+│   ├── SSH 配置 (含空闲超时)
 │   ├── Root 密码状态
 │   ├── 防火墙规则
 │   ├── Fail2ban 状态
@@ -68,14 +71,17 @@ ssh-safekit 主菜单
 
 - 禁用密码登录前强制检查 `authorized_keys` 是否有有效公钥，防止锁死
 - 修改 SSH 端口前自动在防火墙放行新端口
+- RHEL 系自动处理 SELinux 端口策略（`semanage port`），避免改端口后 sshd 启动失败
 - 启用防火墙前强制放行当前 SSH 端口
 - 所有 SSH 配置变更前 `sshd -t` 校验，失败自动回滚
 - 仅使用 `systemctl reload`，不中断现有会话
-- 每次修改前自动备份到带时间戳的文件
+- 每次修改前自动备份到带时间戳的文件，自动保留最近 20 份
+- 自动适配 OpenSSH 版本，新版使用 `KbdInteractiveAuthentication`，旧版使用 `ChallengeResponseAuthentication`
+- 日志文件超过 10MB 时自动轮转
 
 ## 快速开始
 
-### 在线抓取运行（推荐）
+### GitHub下载并运行（推荐）
 
 使用 `curl`：
 
@@ -89,7 +95,7 @@ curl -fsSL https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit
 wget -qO ssh-safekit.sh https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh && chmod +x ssh-safekit.sh && sudo ./ssh-safekit.sh
 ```
 
-### 一行命令直接执行
+### 一键脚本（直接运行）
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh)
@@ -114,6 +120,17 @@ sudo ./ssh-safekit.sh
 sudo SSH_SAFEKIT_LOG=/var/log/my-ssh-audit.log ./ssh-safekit.sh
 ```
 
+## CLI 参数
+
+除交互式菜单外，还支持以下命令行参数：
+
+```bash
+sudo ./ssh-safekit.sh --help      # 显示帮助
+sudo ./ssh-safekit.sh --version   # 显示版本号
+sudo ./ssh-safekit.sh --status    # 非交互式查看安全状态
+sudo ./ssh-safekit.sh --quick     # 直接进入一键加固流程
+```
+
 ## 系统要求
 
 | 发行版 | 版本 | 防火墙 |
@@ -124,6 +141,13 @@ sudo SSH_SAFEKIT_LOG=/var/log/my-ssh-audit.log ./ssh-safekit.sh
 | Rocky Linux | 8+ | firewalld |
 | AlmaLinux | 8+ | firewalld |
 | Fedora | 33+ | firewalld |
+| Alibaba Cloud Linux | 2+ | firewalld |
+| Amazon Linux | 2+ | firewalld |
+| TencentOS Server | 2+ | firewalld |
+| openEuler | 20.03+ | firewalld |
+| 龙蜥 OpenAnolis | 8+ | firewalld |
+| 银河麒麟 Kylin | V10 | firewalld |
+| 统信 UOS | 20+ | firewalld |
 
 - 需要 root 权限或 sudo
 - 需要 systemd

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
+# shellcheck shell=bash
 # ssh-safekit - Linux SSH 安全加固工具
 # https://github.com/DsureD/ssh-safekit
 # License: MIT
 set -euo pipefail
 
 # ===== 全局变量 =====
-VERSION="1.0.0"
+SAFEKIT_VERSION="1.1.0"
 LOG_FILE="${SSH_SAFEKIT_LOG:-/var/log/ssh-safekit.log}"
 BACKUP_DIR="/etc/ssh/backups"
+BACKUP_KEEP=20
+MAX_LOG_SIZE=$((10 * 1024 * 1024))
 SSH_CONFIG="/etc/ssh/sshd_config"
 DROPIN_DIR="/etc/ssh/sshd_config.d"
 DROPIN_FILE="99-ssh-safekit.conf"
@@ -16,6 +19,7 @@ PKG_MGR=""
 SSH_SERVICE=""
 CURRENT_SSH_PORT=""
 SKIP_PAUSE=0
+RUN_MODE="menu"
 
 # ===== 颜色 =====
 if tput colors &>/dev/null && [[ $(tput colors) -ge 8 ]]; then
@@ -25,11 +29,16 @@ else
     RED=""; GREEN=""; YELLOW=""; BLUE=""; BOLD=""; RESET=""
 fi
 
-# ===== 工具函数 =====
-log_info()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*" >> "$LOG_FILE"; echo "${GREEN}[INFO]${RESET} $*"; }
-log_warn()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $*" >> "$LOG_FILE"; echo "${YELLOW}[WARN]${RESET} $*"; }
-log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >> "$LOG_FILE"; echo "${RED}[ERROR]${RESET} $*" >&2; }
+# ===== 清理与信号处理 =====
+cleanup() {
+    stty echo 2>/dev/null || true
+}
+trap cleanup EXIT
 
+# ===== 工具函数 =====
+log_info()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*" >> "$LOG_FILE" 2>/dev/null; echo "${GREEN}[INFO]${RESET} $*"; }
+log_warn()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $*" >> "$LOG_FILE" 2>/dev/null; echo "${YELLOW}[WARN]${RESET} $*"; }
+log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >> "$LOG_FILE" 2>/dev/null; echo "${RED}[ERROR]${RESET} $*" >&2; }
 confirm() {
     local prompt="${1:-确认执行?}"
     local answer
@@ -92,6 +101,73 @@ validate_ip() {
     return 1
 }
 
+get_user_home() {
+    local user="$1"
+    getent passwd "$user" | cut -d: -f6
+}
+
+get_sshd_version() {
+    local ver
+    ver=$(sshd -V 2>&1 | grep -oP 'OpenSSH_\K[0-9]+\.[0-9]+' || echo "0.0")
+    echo "$ver"
+}
+
+disable_kbd_interactive() {
+    local ver
+    ver=$(get_sshd_version)
+    local major minor
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    if [[ "$major" -gt 8 ]] || { [[ "$major" -eq 8 ]] && [[ "$minor" -ge 7 ]]; }; then
+        apply_sshd_setting "KbdInteractiveAuthentication" "no"
+    else
+        apply_sshd_setting "ChallengeResponseAuthentication" "no"
+    fi
+}
+selinux_add_port() {
+    local port="$1"
+    if ! command -v getenforce &>/dev/null; then return 0; fi
+    if ! getenforce 2>/dev/null | grep -qi enforcing; then return 0; fi
+    if ! command -v semanage &>/dev/null; then
+        log_warn "SELinux 为 enforcing 但 semanage 未安装，尝试安装 policycoreutils-python-utils..."
+        install_pkg "policycoreutils-python-utils" || {
+            log_warn "无法安装 semanage，请手动执行: semanage port -a -t ssh_port_t -p tcp ${port}"
+            return 0
+        }
+    fi
+    if semanage port -l 2>/dev/null | grep -q "ssh_port_t.*tcp.*\b${port}\b"; then
+        return 0
+    fi
+    semanage port -a -t ssh_port_t -p tcp "$port" 2>/dev/null || \
+        semanage port -m -t ssh_port_t -p tcp "$port" 2>/dev/null || {
+            log_warn "SELinux 端口策略设置失败，请手动执行: semanage port -a -t ssh_port_t -p tcp ${port}"
+        }
+}
+
+rotate_log() {
+    if [[ ! -f "$LOG_FILE" ]]; then return; fi
+    local size
+    size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+    if [[ "$size" -gt "$MAX_LOG_SIZE" ]]; then
+        mv "$LOG_FILE" "${LOG_FILE}.1"
+        touch "$LOG_FILE"
+        chmod 600 "$LOG_FILE"
+    fi
+}
+
+prune_backups() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then return; fi
+    local -a backups=()
+    while IFS= read -r f; do
+        backups+=("$f")
+    done < <(ls -1t "${BACKUP_DIR}"/sshd_config.bak.* 2>/dev/null | grep -v '\.dropin$')
+    if [[ ${#backups[@]} -le $BACKUP_KEEP ]]; then return; fi
+    local i
+    for ((i=BACKUP_KEEP; i<${#backups[@]}; i++)); do
+        rm -f "${backups[$i]}" "${backups[$i]}.dropin"
+    done
+    log_info "已清理旧备份，保留最近 ${BACKUP_KEEP} 份"
+}
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "此脚本需要 root 权限运行，请使用 sudo 或 root 用户执行"
@@ -104,6 +180,7 @@ detect_os() {
         log_error "无法检测操作系统（缺少 /etc/os-release）"
         exit 1
     fi
+    # shellcheck source=/dev/null
     source /etc/os-release
     case "${ID,,}" in
         ubuntu|debian|linuxmint|pop)
@@ -111,7 +188,7 @@ detect_os() {
             PKG_MGR="apt"
             SSH_SERVICE="ssh"
             ;;
-        centos|rhel|rocky|almalinux|fedora|ol)
+        centos|rhel|rocky|almalinux|fedora|ol|alinux|amzn|openeuler|anolis|tencentos|bclinux|kylin|uos)
             OS_FAMILY="rhel"
             if command -v dnf &>/dev/null; then
                 PKG_MGR="dnf"
@@ -121,7 +198,7 @@ detect_os() {
             SSH_SERVICE="sshd"
             ;;
         *)
-            log_error "不支持的发行版: ${ID}。目前支持 Debian/Ubuntu 和 RHEL/CentOS/Rocky/Alma/Fedora"
+            log_error "不支持的发行版: ${ID}。目前支持 Debian/Ubuntu 和 RHEL/CentOS/Rocky/Alma/Fedora/AliLinux/Amazon Linux/openEuler"
             exit 1
             ;;
     esac
@@ -135,16 +212,16 @@ detect_ssh_port() {
     fi
     CURRENT_SSH_PORT="${CURRENT_SSH_PORT:-22}"
 }
-
 install_pkg() {
     local pkg="$1"
     log_info "正在安装 ${pkg}..."
+    local ret=0
     case "$PKG_MGR" in
-        apt)  apt-get update -qq && apt-get install -y -qq "$pkg" ;;
-        dnf)  dnf install -y -q "$pkg" ;;
-        yum)  yum install -y -q "$pkg" ;;
+        apt)  apt-get update -qq && apt-get install -y -qq "$pkg" || ret=$? ;;
+        dnf)  dnf install -y -q "$pkg" || ret=$? ;;
+        yum)  yum install -y -q "$pkg" || ret=$? ;;
     esac
-    if [[ $? -eq 0 ]]; then
+    if [[ $ret -eq 0 ]]; then
         log_info "${pkg} 安装成功"
     else
         log_error "${pkg} 安装失败"
@@ -160,6 +237,7 @@ backup_sshd() {
         cp "${DROPIN_DIR}/${DROPIN_FILE}" "${backup_file}.dropin"
     fi
     log_info "已备份 sshd_config 到 ${backup_file}"
+    prune_backups
     echo "$backup_file"
 }
 
@@ -182,7 +260,6 @@ reload_sshd() {
         return 1
     fi
 }
-
 rollback_sshd() {
     local backup_file="$1"
     if [[ -f "$backup_file" ]]; then
@@ -208,13 +285,13 @@ apply_sshd_setting() {
     if [[ -d "$DROPIN_DIR" ]]; then
         local dropin="${DROPIN_DIR}/${DROPIN_FILE}"
         if [[ -f "$dropin" ]] && grep -qE "^\s*${key}\s+" "$dropin"; then
-            sed -i "s/^\s*${key}\s.*/${key} ${value}/" "$dropin"
+            sed -i "s|^\s*${key}\s.*|${key} ${value}|" "$dropin"
         else
             echo "${key} ${value}" >> "$dropin"
         fi
     else
         if grep -qE "^\s*#?\s*${key}\s+" "$SSH_CONFIG"; then
-            sed -i "s/^\s*#\?\s*${key}\s.*/${key} ${value}/" "$SSH_CONFIG"
+            sed -i "s|^\s*#\?\s*${key}\s.*|${key} ${value}|" "$SSH_CONFIG"
         else
             echo "${key} ${value}" >> "$SSH_CONFIG"
         fi
@@ -233,14 +310,17 @@ apply_sshd_setting() {
 random_high_port() {
     local port
     while true; do
-        port=$((RANDOM % 55535 + 10000))
+        if command -v shuf &>/dev/null; then
+            port=$(shuf -i 10000-65535 -n 1)
+        else
+            port=$(( (RANDOM * 32768 + RANDOM) % 55536 + 10000 ))
+        fi
         if ! ss -tlnp | grep -q ":${port} "; then
             echo "$port"
             return
         fi
     done
 }
-
 get_target_user() {
     local default_user="${SUDO_USER:-root}"
     local user
@@ -256,7 +336,7 @@ get_target_user() {
 check_authorized_keys() {
     local user="$1"
     local home
-    home=$(eval echo "~${user}")
+    home=$(get_user_home "$user")
     local auth_file="${home}/.ssh/authorized_keys"
     if [[ -f "$auth_file" ]] && [[ -s "$auth_file" ]]; then
         local valid_lines
@@ -271,11 +351,16 @@ check_authorized_keys() {
 # ===== 模块 1: SSH 配置管理 =====
 toggle_root_login() {
     echo ""
-    echo "当前 PermitRootLogin: $(sshd -T 2>/dev/null | grep -i permitrootlogin | awk '{print $2}')"
+    local current
+    current=$(sshd -T 2>/dev/null | grep -i permitrootlogin | awk '{print $2}')
+    echo "当前 PermitRootLogin: ${BOLD}${current}${RESET}"
     echo ""
-    echo "  1) yes              - 允许 root 密码和密钥登录"
-    echo "  2) prohibit-password - 仅允许 root 密钥登录（推荐）"
-    echo "  3) no               - 完全禁止 root 登录"
+    echo "  1) yes              - 允许 root 密码和密钥登录$(
+        [[ "$current" == "yes" ]] && echo " ${GREEN}← 当前${RESET}")"
+    echo "  2) prohibit-password - 仅允许 root 密钥登录（推荐）$(
+        [[ "$current" == "prohibit-password" || "$current" == "without-password" ]] && echo " ${GREEN}← 当前${RESET}")"
+    echo "  3) no               - 完全禁止 root 登录$(
+        [[ "$current" == "no" ]] && echo " ${GREEN}← 当前${RESET}")"
     echo "  0) 返回"
     echo ""
     local choice
@@ -295,13 +380,16 @@ toggle_root_login() {
         *) log_warn "无效选择" ;;
     esac
 }
-
 toggle_password_auth() {
     echo ""
-    echo "当前 PasswordAuthentication: $(sshd -T 2>/dev/null | grep -i passwordauthentication | awk '{print $2}')"
+    local current
+    current=$(sshd -T 2>/dev/null | grep -i passwordauthentication | awk '{print $2}')
+    echo "当前 PasswordAuthentication: ${BOLD}${current}${RESET}"
     echo ""
-    echo "  1) 启用密码登录"
-    echo "  2) 禁用密码登录（仅密钥）"
+    echo "  1) 启用密码登录$(
+        [[ "$current" == "yes" ]] && echo " ${GREEN}← 当前${RESET}")"
+    echo "  2) 禁用密码登录（仅密钥）$(
+        [[ "$current" == "no" ]] && echo " ${GREEN}← 当前${RESET}")"
     echo "  0) 返回"
     echo ""
     local choice
@@ -318,7 +406,7 @@ toggle_password_auth() {
             fi
             if confirm "已确认 ${user} 有有效公钥，禁用密码登录?"; then
                 apply_sshd_setting "PasswordAuthentication" "no"
-                apply_sshd_setting "ChallengeResponseAuthentication" "no"
+                disable_kbd_interactive
             else
                 skip_pause
             fi
@@ -353,7 +441,6 @@ change_ssh_port() {
         0) skip_pause; return ;;
         *) log_warn "无效选择"; return ;;
     esac
-
     if ss -tlnp | grep -q ":${new_port} " && [[ "$new_port" != "$CURRENT_SSH_PORT" ]]; then
         log_error "端口 ${new_port} 已被占用"
         return 1
@@ -361,6 +448,7 @@ change_ssh_port() {
 
     log_info "正在放行新端口 ${new_port} 到防火墙..."
     fw_allow_port_internal "$new_port" "tcp"
+    selinux_add_port "$new_port"
 
     if apply_sshd_setting "Port" "$new_port"; then
         log_info "SSH 端口已更改为 ${new_port}"
@@ -385,6 +473,24 @@ set_auth_limits() {
     apply_sshd_setting "LoginGraceTime" "$grace_time"
 }
 
+set_idle_timeout() {
+    echo ""
+    local current_interval current_count
+    current_interval=$(sshd -T 2>/dev/null | grep -i clientaliveinterval | awk '{print $2}')
+    current_count=$(sshd -T 2>/dev/null | grep -i clientalivecountmax | awk '{print $2}')
+    echo "当前 ClientAliveInterval: ${current_interval:-0} 秒"
+    echo "当前 ClientAliveCountMax: ${current_count:-3}"
+    echo ""
+    echo "说明: 空闲超时 = Interval × CountMax"
+    echo "  例: 300 × 3 = 900 秒 (15 分钟) 无响应后断开"
+    echo ""
+    local interval count
+    interval=$(read_uint "ClientAliveInterval (秒, 0=禁用) [300]: " "300" 0 86400)
+    count=$(read_uint "ClientAliveCountMax [3]: " "3" 1 100)
+
+    apply_sshd_setting "ClientAliveInterval" "$interval"
+    apply_sshd_setting "ClientAliveCountMax" "$count"
+}
 disable_root_password() {
     echo ""
     local status
@@ -404,6 +510,45 @@ disable_root_password() {
     fi
 }
 
+change_root_password() {
+    echo ""
+    local status
+    status=$(passwd -S root 2>/dev/null | awk '{print $2}')
+    echo "当前 root 密码状态: ${status} (L=锁定, P=有密码, NP=无密码)"
+    echo ""
+    if [[ "$status" == "L" ]]; then
+        log_warn "root 密码当前为锁定状态，设置新密码会自动解锁"
+        if ! confirm "继续修改 root 密码?"; then
+            skip_pause
+            return
+        fi
+    fi
+
+    local pr
+    pr=$(sshd -T 2>/dev/null | grep -i permitrootlogin | awk '{print $2}')
+    local pa
+    pa=$(sshd -T 2>/dev/null | grep -i passwordauthentication | awk '{print $2}')
+    if [[ "$pr" == "no" ]]; then
+        log_warn "提示: 当前 PermitRootLogin=no，root 无法通过 SSH 登录（修改密码不影响 sudo）"
+    elif [[ "$pr" == "prohibit-password" || "$pr" == "without-password" ]] && [[ "$pa" == "no" ]]; then
+        log_warn "提示: 当前 SSH 仅允许 root 密钥登录，新密码不能用于 SSH 登录（仅可用于本地/sudo）"
+    fi
+    echo ""
+
+    if ! confirm "确认修改 root 密码?"; then
+        log_info "已取消修改 root 密码"
+        skip_pause
+        return
+    fi
+
+    if passwd root; then
+        log_info "root 密码已修改"
+    else
+        log_error "root 密码修改失败"
+        return 1
+    fi
+}
+
 menu_ssh_config() {
     while true; do
         echo ""
@@ -412,7 +557,9 @@ menu_ssh_config() {
         echo "  2) 密码认证开关"
         echo "  3) 修改 SSH 端口"
         echo "  4) 认证限制 (MaxAuthTries/LoginGraceTime)"
-        echo "  5) 锁定 root 密码 (passwd -l)"
+        echo "  5) 空闲超时 (ClientAliveInterval)"
+        echo "  6) 修改 root 密码 (passwd)"
+        echo "  7) 锁定 root 密码 (passwd -l)"
         echo "  0) 返回主菜单"
         echo ""
         local choice
@@ -422,20 +569,21 @@ menu_ssh_config() {
             2) toggle_password_auth ;;
             3) change_ssh_port ;;
             4) set_auth_limits ;;
-            5) disable_root_password ;;
+            5) set_idle_timeout ;;
+            6) change_root_password ;;
+            7) disable_root_password ;;
             0) return ;;
             *) log_warn "无效选择"; continue ;;
         esac
         press_enter
     done
 }
-
 # ===== 模块 2: SSH 密钥管理 =====
 generate_keypair() {
     local user
     user=$(get_target_user) || return
     local home
-    home=$(eval echo "~${user}")
+    home=$(get_user_home "$user")
     local ssh_dir="${home}/.ssh"
 
     echo ""
@@ -499,7 +647,7 @@ import_pubkey() {
     local user
     user=$(get_target_user) || return
     local home
-    home=$(eval echo "~${user}")
+    home=$(get_user_home "$user")
     local ssh_dir="${home}/.ssh"
     local auth_file="${ssh_dir}/authorized_keys"
 
@@ -534,7 +682,7 @@ list_authorized_keys() {
     local user
     user=$(get_target_user) || return
     local home
-    home=$(eval echo "~${user}")
+    home=$(get_user_home "$user")
     local auth_file="${home}/.ssh/authorized_keys"
 
     echo ""
@@ -579,7 +727,6 @@ menu_ssh_keys() {
         press_enter
     done
 }
-
 # ===== 模块 3: Fail2ban =====
 install_fail2ban() {
     if command -v fail2ban-client &>/dev/null; then
@@ -587,11 +734,12 @@ install_fail2ban() {
         return 0
     fi
     if confirm "安装 fail2ban?"; then
-        install_pkg "fail2ban"
+        install_pkg "fail2ban" || return 1
         systemctl enable fail2ban
         systemctl start fail2ban
     else
         skip_pause
+        return 1
     fi
 }
 
@@ -640,19 +788,9 @@ EOF
     else
         log_warn "sshd jail 尚未激活，可稍后用以下命令检查："
         echo ""
-        echo "  # 查看 sshd jail 状态（最常用）"
         echo "  sudo fail2ban-client status sshd"
-        echo ""
-        echo "  # 查看所有已激活的 jail"
-        echo "  sudo fail2ban-client status"
-        echo ""
-        echo "  # 查看 fail2ban 服务状态"
         echo "  sudo systemctl status fail2ban"
-        echo ""
-        echo "  # 查看实时日志（排错用）"
         echo "  sudo tail -f /var/log/fail2ban.log"
-        echo ""
-        echo "  也可以重新运行本脚本，选择「3) Fail2ban 管理」→「3) 查看状态」"
     fi
 }
 
@@ -709,7 +847,6 @@ menu_fail2ban() {
         press_enter
     done
 }
-
 # ===== 模块 4: 防火墙 =====
 fw_allow_port_internal() {
     local port="$1" proto="${2:-tcp}"
@@ -772,11 +909,37 @@ fw_deny_port() {
         *) log_warn "无效选择，未做任何更改" ;;
     esac
 }
-
 fw_set_default() {
     echo ""
-    echo "  1) 默认拒绝入站，允许出站（推荐）"
-    echo "  2) 默认允许所有"
+    local current_policy="unknown" raw_value="未启用"
+    case "$OS_FAMILY" in
+        debian)
+            if command -v ufw &>/dev/null; then
+                local incoming
+                incoming=$(ufw status verbose 2>/dev/null | grep -i "^Default:" | grep -oP 'deny|reject|allow' | head -1)
+                if [[ -n "$incoming" ]]; then
+                    raw_value="incoming=${incoming}"
+                    [[ "$incoming" == "allow" ]] && current_policy="allow" || current_policy="deny"
+                fi
+            fi
+            ;;
+        rhel)
+            if systemctl is-active firewalld &>/dev/null; then
+                local zone
+                zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+                if [[ -n "$zone" ]]; then
+                    raw_value="default-zone=${zone}"
+                    [[ "$zone" == "trusted" ]] && current_policy="allow" || current_policy="deny"
+                fi
+            fi
+            ;;
+    esac
+    echo "当前默认策略: ${BOLD}${raw_value}${RESET}"
+    echo ""
+    echo "  1) 默认拒绝入站，允许出站（推荐）$(
+        [[ "$current_policy" == "deny" ]] && echo " ${GREEN}← 当前${RESET}")"
+    echo "  2) 默认允许所有$(
+        [[ "$current_policy" == "allow" ]] && echo " ${GREEN}← 当前${RESET}")"
     echo "  0) 返回"
     echo ""
     local choice
@@ -844,7 +1007,6 @@ fw_disable() {
     esac
     log_info "防火墙已禁用"
 }
-
 fw_status() {
     echo ""
     echo "${BOLD}防火墙状态:${RESET}"
@@ -899,7 +1061,6 @@ menu_firewall() {
         press_enter
     done
 }
-
 # ===== 模块 5: 一键推荐加固 =====
 quick_harden() {
     echo ""
@@ -930,25 +1091,27 @@ quick_harden() {
     read -rp "选择 [1]: " port_choice
     case "${port_choice:-1}" in
         2)
-            new_port=$(read_uint "输入新端口 (10000-65535): " "" 10000 65535) || {
+            new_port=$(read_uint "输入新端口 (10000-65535): " "" 10000 65535) || new_port=""
+            if [[ -n "$new_port" ]]; then
+                fw_allow_port_internal "$new_port" "tcp"
+                selinux_add_port "$new_port"
+                apply_sshd_setting "Port" "$new_port"
+                CURRENT_SSH_PORT="$new_port"
+            else
                 log_info "已取消，保持当前端口 ${CURRENT_SSH_PORT}"
-                break
-            }
-            fw_allow_port_internal "$new_port" "tcp"
-            apply_sshd_setting "Port" "$new_port"
-            CURRENT_SSH_PORT="$new_port"
+            fi
             ;;
         3)
             new_port=$(random_high_port)
             log_info "随机端口: ${new_port}"
             fw_allow_port_internal "$new_port" "tcp"
+            selinux_add_port "$new_port"
             apply_sshd_setting "Port" "$new_port"
             CURRENT_SSH_PORT="$new_port"
             ;;
         *) log_info "保持当前端口 ${CURRENT_SSH_PORT}" ;;
     esac
     echo ""
-
     log_info "=== 步骤 3/7: SSH 密钥配置 ==="
     local target_user input_user
     target_user="${SUDO_USER:-root}"
@@ -1002,13 +1165,12 @@ quick_harden() {
         log_info "防火墙已启用，SSH 端口 ${CURRENT_SSH_PORT} 已放行"
     fi
     echo ""
-
     log_info "=== 步骤 5/7: 安装 Fail2ban ==="
     if confirm "安装并配置 Fail2ban?"; then
-        install_fail2ban
-        local jail_dir="/etc/fail2ban/jail.d"
-        mkdir -p "$jail_dir"
-        cat > "${jail_dir}/sshd-ssh-safekit.local" <<EOF
+        if install_fail2ban; then
+            local jail_dir="/etc/fail2ban/jail.d"
+            mkdir -p "$jail_dir"
+            cat > "${jail_dir}/sshd-ssh-safekit.local" <<EOF
 [sshd]
 enabled = true
 port = ${CURRENT_SSH_PORT}
@@ -1019,8 +1181,9 @@ findtime = 600
 maxretry = 5
 banaction = %(banaction_allports)s
 EOF
-        systemctl restart fail2ban
-        log_info "Fail2ban 已配置 (bantime=3600s, maxretry=5)"
+            systemctl restart fail2ban
+            log_info "Fail2ban 已配置 (bantime=3600s, maxretry=5)"
+        fi
     fi
     echo ""
 
@@ -1028,7 +1191,7 @@ EOF
     if check_authorized_keys "$target_user"; then
         if confirm "禁用密码登录（仅允许密钥登录）?"; then
             apply_sshd_setting "PasswordAuthentication" "no"
-            apply_sshd_setting "ChallengeResponseAuthentication" "no"
+            disable_kbd_interactive
             log_info "密码登录已禁用"
         fi
     else
@@ -1079,7 +1242,6 @@ fw_status_oneliner() {
         *) echo "未知" ;;
     esac
 }
-
 # ===== 模块 6: 状态查看 =====
 show_status() {
     echo ""
@@ -1088,6 +1250,7 @@ show_status() {
 
     echo "${BOLD}[系统]${RESET}"
     if [[ -f /etc/os-release ]]; then
+        # shellcheck source=/dev/null
         source /etc/os-release
         echo "  发行版: ${PRETTY_NAME:-$ID}"
     fi
@@ -1106,6 +1269,8 @@ show_status() {
         echo "  PubkeyAuthentication:  $(echo "$conf" | grep -i "^pubkeyauthentication" | awk '{print $2}')"
         echo "  MaxAuthTries:          $(echo "$conf" | grep -i "^maxauthtries" | awk '{print $2}')"
         echo "  LoginGraceTime:        $(echo "$conf" | grep -i "^logingracetime" | awk '{print $2}')"
+        echo "  ClientAliveInterval:   $(echo "$conf" | grep -i "^clientaliveinterval" | awk '{print $2}')"
+        echo "  ClientAliveCountMax:   $(echo "$conf" | grep -i "^clientalivecountmax" | awk '{print $2}')"
     else
         log_warn "sshd 未安装"
     fi
@@ -1143,7 +1308,6 @@ show_status() {
             ;;
     esac
     echo ""
-
     echo "${BOLD}[Fail2ban]${RESET}"
     if command -v fail2ban-client &>/dev/null; then
         if systemctl is-active fail2ban &>/dev/null; then
@@ -1208,13 +1372,12 @@ restore_backup() {
     rollback_sshd "$target"
     press_enter
 }
-
 # ===== 主菜单 =====
 print_banner() {
     cat <<EOF
 ${BOLD}${BLUE}
 ============================================================
-   ssh-safekit  v${VERSION}   -  Linux SSH 安全加固工具
+   ssh-safekit  v${SAFEKIT_VERSION}   -  Linux SSH 安全加固工具
    【开源地址】 https://github.com/DsureD/ssh-safekit
 ============================================================
 ${RESET}
@@ -1254,7 +1417,23 @@ main_menu() {
     done
 }
 
-# ===== 入口 =====
+# ===== CLI 参数与入口 =====
+usage() {
+    cat <<EOF
+ssh-safekit v${SAFEKIT_VERSION} - Linux SSH 安全加固工具
+
+用法: $0 [选项]
+
+选项:
+  -h, --help      显示帮助信息
+  -v, --version   显示版本号
+  --status        显示当前安全状态（非交互）
+  --quick         启动一键加固流程
+
+无参数时进入交互式菜单。
+EOF
+}
+
 init() {
     check_root
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
@@ -1262,10 +1441,26 @@ init() {
         log_warn "无法写入日志文件 ${LOG_FILE}，将仅输出到终端"
     }
     chmod 600 "$LOG_FILE" 2>/dev/null || true
+    rotate_log
     detect_os
     detect_ssh_port
     mkdir -p "$BACKUP_DIR"
 }
 
+# 解析 CLI 参数
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    -v|--version) echo "ssh-safekit v${SAFEKIT_VERSION}"; exit 0 ;;
+    --status) RUN_MODE="status" ;;
+    --quick) RUN_MODE="quick" ;;
+    "") RUN_MODE="menu" ;;
+    *) echo "未知选项: $1"; usage; exit 1 ;;
+esac
+
 init
-main_menu
+
+case "$RUN_MODE" in
+    status) show_status ;;
+    quick) quick_harden ;;
+    menu) main_menu ;;
+esac
