@@ -453,6 +453,7 @@ change_ssh_port() {
     if apply_sshd_setting "Port" "$new_port"; then
         log_info "SSH 端口已更改为 ${new_port}"
         log_warn "请立即使用新端口测试连接: ssh -p ${new_port} user@host"
+        log_warn "如果是云服务器，还需要在云厂商控制台的安全组中放行端口 ${new_port}/TCP"
         CURRENT_SSH_PORT="$new_port"
     fi
 }
@@ -1220,6 +1221,9 @@ EOF
     echo ""
     log_warn "请立即用新配置测试 SSH 连接，不要关闭当前会话！"
     log_warn "测试命令: ssh -p ${CURRENT_SSH_PORT} ${target_user}@<服务器IP>"
+    if [[ "$CURRENT_SSH_PORT" != "22" ]]; then
+        log_warn "如果是云服务器，请确认安全组已放行端口 ${CURRENT_SSH_PORT}/TCP"
+    fi
     press_enter
 }
 
