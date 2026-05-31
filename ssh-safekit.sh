@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ===== 全局变量 =====
-SAFEKIT_VERSION="1.1.0"
+SAFEKIT_VERSION="1.2.0"
 LOG_FILE="${SSH_SAFEKIT_LOG:-/var/log/ssh-safekit.log}"
 BACKUP_DIR="/etc/ssh/backups"
 BACKUP_KEEP=20
@@ -17,6 +17,8 @@ DROPIN_FILE="99-ssh-safekit.conf"
 OS_FAMILY=""
 PKG_MGR=""
 SSH_SERVICE=""
+FW_TOOL=""
+INIT_SYSTEM=""
 CURRENT_SSH_PORT=""
 SKIP_PAUSE=0
 RUN_MODE="menu"
@@ -176,33 +178,171 @@ check_root() {
 }
 
 detect_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        log_error "无法检测操作系统（缺少 /etc/os-release）"
+    # 读取系统信息
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+    else
+        log_warn "缺少 /etc/os-release，将仅依赖工具检测"
+        ID="unknown"
+        PRETTY_NAME="Unknown Linux"
+    fi
+
+    # 基于能力检测：检测包管理器
+    if command -v apt-get &>/dev/null; then
+        OS_FAMILY="debian"
+        PKG_MGR="apt"
+        SSH_SERVICE="ssh"
+    elif command -v apk &>/dev/null; then
+        OS_FAMILY="alpine"
+        PKG_MGR="apk"
+        SSH_SERVICE="sshd"
+    elif command -v dnf &>/dev/null; then
+        OS_FAMILY="rhel"
+        PKG_MGR="dnf"
+        SSH_SERVICE="sshd"
+    elif command -v yum &>/dev/null; then
+        OS_FAMILY="rhel"
+        PKG_MGR="yum"
+        SSH_SERVICE="sshd"
+    elif command -v pacman &>/dev/null; then
+        OS_FAMILY="arch"
+        PKG_MGR="pacman"
+        SSH_SERVICE="sshd"
+    elif command -v zypper &>/dev/null; then
+        OS_FAMILY="suse"
+        PKG_MGR="zypper"
+        SSH_SERVICE="sshd"
+    else
+        log_error "无法识别包管理器。支持: apt/apk/dnf/yum/pacman/zypper"
+        log_error "请手动安装 openssh-server 后重试"
         exit 1
     fi
-    # shellcheck source=/dev/null
-    source /etc/os-release
-    case "${ID,,}" in
-        ubuntu|debian|linuxmint|pop)
-            OS_FAMILY="debian"
-            PKG_MGR="apt"
-            SSH_SERVICE="ssh"
+
+    # 检测防火墙工具
+    if command -v ufw &>/dev/null; then
+        FW_TOOL="ufw"
+    elif command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null 2>&1; then
+        FW_TOOL="firewalld"
+    elif command -v iptables &>/dev/null; then
+        FW_TOOL="iptables"
+    else
+        FW_TOOL="none"
+        log_warn "未检测到防火墙工具，防火墙功能将不可用"
+    fi
+
+    # 检测 init 系统
+    if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service &>/dev/null; then
+        INIT_SYSTEM="openrc"
+    elif command -v service &>/dev/null; then
+        INIT_SYSTEM="sysvinit"
+    else
+        INIT_SYSTEM="unknown"
+        log_warn "无法识别 init 系统，服务管理功能可能受限"
+    fi
+
+    log_info "检测到系统: ${PRETTY_NAME:-$ID}"
+    log_info "  包管理器: ${PKG_MGR} | SSH服务: ${SSH_SERVICE} | 防火墙: ${FW_TOOL} | Init: ${INIT_SYSTEM}"
+}
+
+# ===== 服务管理抽象层 =====
+service_enable() {
+    local service="$1"
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl enable "$service" 2>/dev/null
             ;;
-        centos|rhel|rocky|almalinux|fedora|ol|alinux|amzn|openeuler|anolis|tencentos|bclinux|kylin|uos)
-            OS_FAMILY="rhel"
-            if command -v dnf &>/dev/null; then
-                PKG_MGR="dnf"
-            else
-                PKG_MGR="yum"
+        openrc)
+            rc-update add "$service" default 2>/dev/null
+            ;;
+        sysvinit)
+            if command -v chkconfig &>/dev/null; then
+                chkconfig "$service" on 2>/dev/null
+            elif command -v update-rc.d &>/dev/null; then
+                update-rc.d "$service" defaults 2>/dev/null
             fi
-            SSH_SERVICE="sshd"
             ;;
         *)
-            log_error "不支持的发行版: ${ID}。目前支持 Debian/Ubuntu 和 RHEL/CentOS/Rocky/Alma/Fedora/AliLinux/Amazon Linux/openEuler"
-            exit 1
+            log_warn "未知 init 系统，跳过服务自启动设置"
             ;;
     esac
-    log_info "检测到系统: ${PRETTY_NAME:-$ID} (${OS_FAMILY}系, 包管理器: ${PKG_MGR})"
+}
+
+service_start() {
+    local service="$1"
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl start "$service" 2>/dev/null
+            ;;
+        openrc)
+            rc-service "$service" start 2>/dev/null
+            ;;
+        sysvinit)
+            service "$service" start 2>/dev/null
+            ;;
+        *)
+            log_warn "未知 init 系统，无法启动服务"
+            return 1
+            ;;
+    esac
+}
+
+service_reload() {
+    local service="$1"
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl reload "$service" 2>/dev/null
+            ;;
+        openrc)
+            rc-service "$service" reload 2>/dev/null || rc-service "$service" restart 2>/dev/null
+            ;;
+        sysvinit)
+            service "$service" reload 2>/dev/null || service "$service" restart 2>/dev/null
+            ;;
+        *)
+            log_warn "未知 init 系统，无法重载服务"
+            return 1
+            ;;
+    esac
+}
+
+service_restart() {
+    local service="$1"
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl restart "$service" 2>/dev/null
+            ;;
+        openrc)
+            rc-service "$service" restart 2>/dev/null
+            ;;
+        sysvinit)
+            service "$service" restart 2>/dev/null
+            ;;
+        *)
+            log_warn "未知 init 系统，无法重启服务"
+            return 1
+            ;;
+    esac
+}
+
+service_is_active() {
+    local service="$1"
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl is-active "$service" &>/dev/null
+            ;;
+        openrc)
+            rc-service "$service" status &>/dev/null
+            ;;
+        sysvinit)
+            service "$service" status &>/dev/null
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 detect_ssh_port() {
@@ -217,9 +357,28 @@ install_pkg() {
     log_info "正在安装 ${pkg}..."
     local ret=0
     case "$PKG_MGR" in
-        apt)  apt-get update -qq && apt-get install -y -qq "$pkg" || ret=$? ;;
-        dnf)  dnf install -y -q "$pkg" || ret=$? ;;
-        yum)  yum install -y -q "$pkg" || ret=$? ;;
+        apt)
+            apt-get update -qq && apt-get install -y -qq "$pkg" || ret=$?
+            ;;
+        dnf)
+            dnf install -y -q "$pkg" || ret=$?
+            ;;
+        yum)
+            yum install -y -q "$pkg" || ret=$?
+            ;;
+        apk)
+            apk add --no-cache "$pkg" || ret=$?
+            ;;
+        pacman)
+            pacman -Sy --noconfirm "$pkg" || ret=$?
+            ;;
+        zypper)
+            zypper install -y "$pkg" || ret=$?
+            ;;
+        *)
+            log_error "不支持的包管理器: ${PKG_MGR}"
+            return 1
+            ;;
     esac
     if [[ $ret -eq 0 ]]; then
         log_info "${pkg} 安装成功"
@@ -252,7 +411,7 @@ validate_sshd() {
 
 reload_sshd() {
     if validate_sshd; then
-        systemctl reload "$SSH_SERVICE"
+        service_reload "$SSH_SERVICE"
         log_info "SSH 服务已重载"
         return 0
     else
@@ -322,14 +481,28 @@ random_high_port() {
     done
 }
 get_target_user() {
-    local default_user="${SUDO_USER:-root}"
+    local default_user
+
+    # 优先使用 SUDO_USER（如果存在且不是 root）
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        default_user="$SUDO_USER"
+    else
+        # 尝试找到第一个非系统用户（UID >= 1000 且 < 65534）
+        default_user=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1; exit}' /etc/passwd 2>/dev/null)
+
+        # 如果没有普通用户，使用 root
+        default_user="${default_user:-root}"
+    fi
+
     local user
     read -rp "目标用户 [${default_user}]: " user
     user="${user:-$default_user}"
+
     if ! id "$user" &>/dev/null; then
         log_error "用户 ${user} 不存在"
         return 1
     fi
+
     echo "$user"
 }
 
@@ -736,8 +909,8 @@ install_fail2ban() {
     fi
     if confirm "安装 fail2ban?"; then
         install_pkg "fail2ban" || return 1
-        systemctl enable fail2ban
-        systemctl start fail2ban
+        service_enable fail2ban
+        service_start fail2ban
     else
         skip_pause
         return 1
@@ -758,12 +931,19 @@ configure_fail2ban_jail() {
     maxretry=$(read_uint "最大失败次数 (默认 5): " "5" 1 100)
 
     mkdir -p "$jail_dir"
+
+    # 根据 init 系统选择 backend
+    local backend="systemd"
+    if [[ "$INIT_SYSTEM" != "systemd" ]]; then
+        backend="auto"
+    fi
+
     cat > "$jail_file" <<EOF
 [sshd]
 enabled = true
 port = ${CURRENT_SSH_PORT}
 filter = sshd
-backend = systemd
+backend = ${backend}
 bantime = ${bantime}
 findtime = ${findtime}
 maxretry = ${maxretry}
@@ -771,7 +951,7 @@ banaction = %(banaction_allports)s
 EOF
 
     log_info "Fail2ban 配置已写入 ${jail_file}"
-    systemctl restart fail2ban
+    service_restart fail2ban
     log_info "Fail2ban 已重启，等待 jail 激活..."
     echo ""
 
@@ -790,7 +970,11 @@ EOF
         log_warn "sshd jail 尚未激活，可稍后用以下命令检查："
         echo ""
         echo "  sudo fail2ban-client status sshd"
-        echo "  sudo systemctl status fail2ban"
+        if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+            echo "  sudo systemctl status fail2ban"
+        else
+            echo "  sudo rc-service fail2ban status"
+        fi
         echo "  sudo tail -f /var/log/fail2ban.log"
     fi
 }
@@ -851,27 +1035,57 @@ menu_fail2ban() {
 # ===== 模块 4: 防火墙 =====
 fw_allow_port_internal() {
     local port="$1" proto="${2:-tcp}"
-    case "$OS_FAMILY" in
-        debian)
-            command -v ufw &>/dev/null || install_pkg ufw
+    case "$FW_TOOL" in
+        ufw)
             ufw allow "${port}/${proto}" >/dev/null 2>&1
             ;;
-        rhel)
+        firewalld)
             firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1
             firewall-cmd --reload >/dev/null 2>&1
+            ;;
+        iptables)
+            # 检查规则是否已存在
+            if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
+                iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT
+            fi
+            # 尝试保存规则（不同发行版路径不同）
+            if command -v iptables-save &>/dev/null; then
+                if [[ -d /etc/iptables ]]; then
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                elif [[ -f /etc/sysconfig/iptables ]]; then
+                    iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+                fi
+            fi
+            ;;
+        none)
+            log_warn "未安装防火墙工具，跳过端口放行"
             ;;
     esac
 }
 
 fw_deny_port_internal() {
     local port="$1" proto="${2:-tcp}"
-    case "$OS_FAMILY" in
-        debian)
+    case "$FW_TOOL" in
+        ufw)
             ufw delete allow "${port}/${proto}" >/dev/null 2>&1
             ;;
-        rhel)
+        firewalld)
             firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1
             firewall-cmd --reload >/dev/null 2>&1
+            ;;
+        iptables)
+            iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+            # 尝试保存规则
+            if command -v iptables-save &>/dev/null; then
+                if [[ -d /etc/iptables ]]; then
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                elif [[ -f /etc/sysconfig/iptables ]]; then
+                    iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+                fi
+            fi
+            ;;
+        none)
+            log_warn "未安装防火墙工具，跳过端口关闭"
             ;;
     esac
 }
@@ -913,19 +1127,17 @@ fw_deny_port() {
 fw_set_default() {
     echo ""
     local current_policy="unknown" raw_value="未启用"
-    case "$OS_FAMILY" in
-        debian)
-            if command -v ufw &>/dev/null; then
-                local incoming
-                incoming=$(ufw status verbose 2>/dev/null | grep -i "^Default:" | grep -oP 'deny|reject|allow' | head -1)
-                if [[ -n "$incoming" ]]; then
-                    raw_value="incoming=${incoming}"
-                    [[ "$incoming" == "allow" ]] && current_policy="allow" || current_policy="deny"
-                fi
+    case "$FW_TOOL" in
+        ufw)
+            local incoming
+            incoming=$(ufw status verbose 2>/dev/null | grep -i "^Default:" | grep -oP 'deny|reject|allow' | head -1)
+            if [[ -n "$incoming" ]]; then
+                raw_value="incoming=${incoming}"
+                [[ "$incoming" == "allow" ]] && current_policy="allow" || current_policy="deny"
             fi
             ;;
-        rhel)
-            if systemctl is-active firewalld &>/dev/null; then
+        firewalld)
+            if service_is_active firewalld; then
                 local zone
                 zone=$(firewall-cmd --get-default-zone 2>/dev/null)
                 if [[ -n "$zone" ]]; then
@@ -933,6 +1145,17 @@ fw_set_default() {
                     [[ "$zone" == "trusted" ]] && current_policy="allow" || current_policy="deny"
                 fi
             fi
+            ;;
+        iptables)
+            local policy
+            policy=$(iptables -L INPUT -n 2>/dev/null | grep "^Chain INPUT" | grep -oP 'policy \K\w+')
+            if [[ -n "$policy" ]]; then
+                raw_value="INPUT policy=${policy}"
+                [[ "$policy" == "ACCEPT" ]] && current_policy="allow" || current_policy="deny"
+            fi
+            ;;
+        none)
+            raw_value="无防火墙"
             ;;
     esac
     echo "当前默认策略: ${BOLD}${raw_value}${RESET}"
@@ -947,25 +1170,60 @@ fw_set_default() {
     read -rp "选择 [1]: " choice
     case "${choice:-1}" in
         1)
-            case "$OS_FAMILY" in
-                debian)
+            case "$FW_TOOL" in
+                ufw)
                     ufw default deny incoming
                     ufw default allow outgoing
                     ;;
-                rhel)
+                firewalld)
                     firewall-cmd --set-default-zone=drop 2>/dev/null
+                    ;;
+                iptables)
+                    iptables -P INPUT DROP 2>/dev/null
+                    iptables -P FORWARD DROP 2>/dev/null
+                    iptables -P OUTPUT ACCEPT 2>/dev/null
+                    # 允许已建立的连接
+                    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+                    iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+                    # 保存规则
+                    if command -v iptables-save &>/dev/null; then
+                        if [[ -d /etc/iptables ]]; then
+                            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                        elif [[ -f /etc/sysconfig/iptables ]]; then
+                            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+                        fi
+                    fi
+                    ;;
+                none)
+                    log_warn "无防火墙工具，无法设置策略"
                     ;;
             esac
             log_info "已设置默认策略: 拒绝入站，允许出站"
             ;;
         2)
-            case "$OS_FAMILY" in
-                debian)
+            case "$FW_TOOL" in
+                ufw)
                     ufw default allow incoming
                     ufw default allow outgoing
                     ;;
-                rhel)
+                firewalld)
                     firewall-cmd --set-default-zone=trusted 2>/dev/null
+                    ;;
+                iptables)
+                    iptables -P INPUT ACCEPT 2>/dev/null
+                    iptables -P FORWARD ACCEPT 2>/dev/null
+                    iptables -P OUTPUT ACCEPT 2>/dev/null
+                    # 保存规则
+                    if command -v iptables-save &>/dev/null; then
+                        if [[ -d /etc/iptables ]]; then
+                            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                        elif [[ -f /etc/sysconfig/iptables ]]; then
+                            iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+                        fi
+                    fi
+                    ;;
+                none)
+                    log_warn "无防火墙工具，无法设置策略"
                     ;;
             esac
             log_info "已设置默认策略: 允许所有"
@@ -985,15 +1243,40 @@ fw_enable() {
         return
     fi
 
-    case "$OS_FAMILY" in
-        debian)
+    case "$FW_TOOL" in
+        ufw)
             command -v ufw &>/dev/null || install_pkg ufw
             ufw --force enable
-            systemctl enable ufw
+            service_enable ufw
             ;;
-        rhel)
-            systemctl start firewalld
-            systemctl enable firewalld
+        firewalld)
+            service_start firewalld
+            service_enable firewalld
+            ;;
+        iptables)
+            log_info "iptables 规则已应用，建议安装 iptables-persistent 以持久化规则"
+            if [[ "$OS_FAMILY" == "debian" ]] && confirm "是否安装 iptables-persistent?"; then
+                install_pkg iptables-persistent
+            elif [[ "$OS_FAMILY" == "alpine" ]] && confirm "是否配置 iptables 开机自启?"; then
+                # Alpine 使用 iptables-save/restore
+                if [[ ! -f /etc/iptables/rules.v4 ]]; then
+                    mkdir -p /etc/iptables
+                    iptables-save > /etc/iptables/rules.v4
+                fi
+                # 添加到启动脚本
+                if [[ -d /etc/local.d ]]; then
+                    cat > /etc/local.d/iptables.start <<'EOF'
+#!/bin/sh
+iptables-restore < /etc/iptables/rules.v4
+EOF
+                    chmod +x /etc/local.d/iptables.start
+                    rc-update add local default 2>/dev/null || true
+                fi
+            fi
+            ;;
+        none)
+            log_error "未检测到防火墙工具，无法启用"
+            return 1
             ;;
     esac
     log_info "防火墙已启用"
@@ -1002,29 +1285,54 @@ fw_enable() {
 fw_disable() {
     log_warn "禁用防火墙将移除所有端口限制"
     if ! confirm "确认禁用防火墙?"; then skip_pause; return; fi
-    case "$OS_FAMILY" in
-        debian) ufw disable ;;
-        rhel) systemctl stop firewalld ;;
+    case "$FW_TOOL" in
+        ufw)
+            ufw disable
+            ;;
+        firewalld)
+            service_stop firewalld 2>/dev/null || systemctl stop firewalld 2>/dev/null
+            ;;
+        iptables)
+            iptables -F
+            iptables -X
+            iptables -P INPUT ACCEPT
+            iptables -P FORWARD ACCEPT
+            iptables -P OUTPUT ACCEPT
+            ;;
+        none)
+            log_warn "未检测到防火墙工具"
+            ;;
     esac
     log_info "防火墙已禁用"
 }
 fw_status() {
     echo ""
     echo "${BOLD}防火墙状态:${RESET}"
-    case "$OS_FAMILY" in
-        debian)
+    case "$FW_TOOL" in
+        ufw)
             if command -v ufw &>/dev/null; then
                 ufw status verbose
             else
                 log_warn "ufw 未安装"
             fi
             ;;
-        rhel)
-            if systemctl is-active firewalld &>/dev/null; then
+        firewalld)
+            if service_is_active firewalld; then
                 firewall-cmd --list-all
             else
                 log_warn "firewalld 未运行"
             fi
+            ;;
+        iptables)
+            if command -v iptables &>/dev/null; then
+                echo "INPUT 链规则:"
+                iptables -L INPUT -n -v --line-numbers
+            else
+                log_warn "iptables 未安装"
+            fi
+            ;;
+        none)
+            log_warn "未检测到防火墙工具"
             ;;
     esac
 }
@@ -1032,12 +1340,7 @@ fw_status() {
 menu_firewall() {
     while true; do
         echo ""
-        local fw_name
-        case "$OS_FAMILY" in
-            debian) fw_name="ufw" ;;
-            rhel) fw_name="firewalld" ;;
-            *) fw_name="防火墙" ;;
-        esac
+        local fw_name="${FW_TOOL:-未知}"
         echo "${BOLD}====== 防火墙管理 (${fw_name}) ======${RESET}"
         echo "  1) 放行端口"
         echo "  2) 关闭端口"
@@ -1115,7 +1418,15 @@ quick_harden() {
     echo ""
     log_info "=== 步骤 3/7: SSH 密钥配置 ==="
     local target_user input_user
-    target_user="${SUDO_USER:-root}"
+
+    # 智能选择默认用户
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        target_user="$SUDO_USER"
+    else
+        target_user=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1; exit}' /etc/passwd 2>/dev/null)
+        target_user="${target_user:-root}"
+    fi
+
     read -rp "目标用户 [${target_user}]: " input_user
     target_user="${input_user:-$target_user}"
 
@@ -1148,19 +1459,34 @@ quick_harden() {
     log_info "=== 步骤 4/7: 防火墙配置 ==="
     if confirm "启用防火墙并设置默认拒绝入站?"; then
         fw_allow_port_internal "$CURRENT_SSH_PORT" "tcp"
-        case "$OS_FAMILY" in
-            debian)
+        case "$FW_TOOL" in
+            ufw)
                 command -v ufw &>/dev/null || install_pkg ufw
                 ufw default deny incoming
                 ufw default allow outgoing
                 ufw --force enable
-                systemctl enable ufw
+                service_enable ufw
                 ;;
-            rhel)
-                systemctl start firewalld 2>/dev/null
-                systemctl enable firewalld
+            firewalld)
+                service_start firewalld 2>/dev/null
+                service_enable firewalld
                 firewall-cmd --permanent --add-port="${CURRENT_SSH_PORT}/tcp" >/dev/null 2>&1
                 firewall-cmd --reload >/dev/null 2>&1
+                ;;
+            iptables)
+                iptables -P INPUT DROP 2>/dev/null
+                iptables -P FORWARD DROP 2>/dev/null
+                iptables -P OUTPUT ACCEPT 2>/dev/null
+                iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+                iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
+                fw_allow_port_internal "$CURRENT_SSH_PORT" "tcp"
+                if [[ "$OS_FAMILY" == "alpine" ]]; then
+                    mkdir -p /etc/iptables
+                    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+                fi
+                ;;
+            none)
+                log_warn "未检测到防火墙工具，跳过防火墙配置"
                 ;;
         esac
         log_info "防火墙已启用，SSH 端口 ${CURRENT_SSH_PORT} 已放行"
@@ -1171,18 +1497,25 @@ quick_harden() {
         if install_fail2ban; then
             local jail_dir="/etc/fail2ban/jail.d"
             mkdir -p "$jail_dir"
+
+            # 根据 init 系统选择 backend
+            local backend="systemd"
+            if [[ "$INIT_SYSTEM" != "systemd" ]]; then
+                backend="auto"
+            fi
+
             cat > "${jail_dir}/sshd-ssh-safekit.local" <<EOF
 [sshd]
 enabled = true
 port = ${CURRENT_SSH_PORT}
 filter = sshd
-backend = systemd
+backend = ${backend}
 bantime = 3600
 findtime = 600
 maxretry = 5
 banaction = %(banaction_allports)s
 EOF
-            systemctl restart fail2ban
+            service_restart fail2ban
             log_info "Fail2ban 已配置 (bantime=3600s, maxretry=5)"
         fi
     fi
@@ -1217,7 +1550,7 @@ EOF
     echo "  密码登录:        $(sshd -T 2>/dev/null | grep -i passwordauthentication | awk '{print $2}')"
     echo "  Root 登录:       $(sshd -T 2>/dev/null | grep -i permitrootlogin | awk '{print $2}')"
     echo "  防火墙:          $(fw_status_oneliner)"
-    echo "  Fail2ban:        $(systemctl is-active fail2ban 2>/dev/null || echo '未安装')"
+    echo "  Fail2ban:        $(service_is_active fail2ban 2>/dev/null && echo '运行中' || echo '未安装/未运行')"
     echo ""
     log_warn "请立即用新配置测试 SSH 连接，不要关闭当前会话！"
     log_warn "测试命令: ssh -p ${CURRENT_SSH_PORT} ${target_user}@<服务器IP>"
@@ -1228,22 +1561,40 @@ EOF
 }
 
 fw_status_oneliner() {
-    case "$OS_FAMILY" in
-        debian)
+    case "$FW_TOOL" in
+        ufw)
             if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
                 echo "ufw 已启用"
             else
                 echo "未启用"
             fi
             ;;
-        rhel)
-            if systemctl is-active firewalld &>/dev/null; then
+        firewalld)
+            if service_is_active firewalld; then
                 echo "firewalld 已启用"
             else
                 echo "未启用"
             fi
             ;;
-        *) echo "未知" ;;
+        iptables)
+            if command -v iptables &>/dev/null; then
+                local policy
+                policy=$(iptables -L INPUT -n 2>/dev/null | grep "^Chain INPUT" | grep -oP 'policy \K\w+')
+                if [[ "$policy" == "DROP" || "$policy" == "REJECT" ]]; then
+                    echo "iptables 已启用 (policy: ${policy})"
+                else
+                    echo "iptables 已安装但策略为 ACCEPT"
+                fi
+            else
+                echo "未启用"
+            fi
+            ;;
+        none)
+            echo "未安装"
+            ;;
+        *)
+            echo "未知"
+            ;;
     esac
 }
 # ===== 模块 6: 状态查看 =====
@@ -1294,27 +1645,38 @@ show_status() {
     echo ""
 
     echo "${BOLD}[防火墙]${RESET}"
-    if [[ -z "$OS_FAMILY" ]]; then detect_os; fi
-    case "$OS_FAMILY" in
-        debian)
+    if [[ -z "$FW_TOOL" ]]; then detect_os; fi
+    case "$FW_TOOL" in
+        ufw)
             if command -v ufw &>/dev/null; then
                 ufw status verbose | sed 's/^/  /'
             else
                 echo "  ufw 未安装"
             fi
             ;;
-        rhel)
-            if systemctl is-active firewalld &>/dev/null; then
+        firewalld)
+            if service_is_active firewalld; then
                 firewall-cmd --list-all | sed 's/^/  /'
             else
                 echo "  firewalld 未运行"
             fi
             ;;
+        iptables)
+            if command -v iptables &>/dev/null; then
+                echo "  INPUT 链规则:"
+                iptables -L INPUT -n --line-numbers 2>/dev/null | sed 's/^/    /'
+            else
+                echo "  iptables 未安装"
+            fi
+            ;;
+        none)
+            echo "  未检测到防火墙工具"
+            ;;
     esac
     echo ""
     echo "${BOLD}[Fail2ban]${RESET}"
     if command -v fail2ban-client &>/dev/null; then
-        if systemctl is-active fail2ban &>/dev/null; then
+        if service_is_active fail2ban; then
             fail2ban-client status sshd 2>/dev/null | sed 's/^/  /' || echo "  sshd jail 未启用"
         else
             echo "  fail2ban 未运行"
@@ -1406,8 +1768,8 @@ main_menu() {
         echo "  0) 退出"
         echo ""
         local choice
-        read -rp "请选择: " choice
-        case "$choice" in
+        read -rp "请选择 [6]: " choice
+        case "${choice:-6}" in
             1) menu_ssh_config ;;
             2) menu_ssh_keys ;;
             3) menu_fail2ban ;;
