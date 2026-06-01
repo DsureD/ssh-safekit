@@ -98,13 +98,13 @@ ssh-safekit 主菜单
 使用 `curl`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh -o ssh-safekit.sh && chmod +x ssh-safekit.sh && sudo ./ssh-safekit.sh
+curl -fsSL https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh -o ssh-safekit.sh && chmod +x ssh-safekit.sh && ./ssh-safekit.sh
 ```
 
 使用 `wget`：
 
 ```bash
-wget -qO ssh-safekit.sh https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh && chmod +x ssh-safekit.sh && sudo ./ssh-safekit.sh
+wget -qO ssh-safekit.sh https://raw.githubusercontent.com/DsureD/ssh-safekit/main/ssh-safekit.sh && chmod +x ssh-safekit.sh && ./ssh-safekit.sh
 ```
 
 ### 一键脚本（直接运行）

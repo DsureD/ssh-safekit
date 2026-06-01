@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ===== 全局变量 =====
-SAFEKIT_VERSION="1.2.0"
+SAFEKIT_VERSION="1.2.1"
 LOG_FILE="${SSH_SAFEKIT_LOG:-/var/log/ssh-safekit.log}"
 BACKUP_DIR="/etc/ssh/backups"
 BACKUP_KEEP=20
@@ -88,9 +88,11 @@ read_uint() {
 
 validate_ip() {
     local ip="$1"
-    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    local ipv4_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    if [[ "$ip" =~ $ipv4_regex ]]; then
         local IFS=.
-        local -a parts=($ip)
+        local -a parts
+        read -r -a parts <<< "$ip"
         local p
         for p in "${parts[@]}"; do
             [[ "$p" -le 255 ]] || return 1
@@ -172,7 +174,9 @@ prune_backups() {
 }
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "此脚本需要 root 权限运行，请使用 sudo 或 root 用户执行"
+        echo "${RED}[ERROR]${RESET} 此脚本需要 root 权限运行。" >&2
+        echo "请使用 sudo 执行，例如：sudo $0" >&2
+        echo "如果系统没有 sudo，请先切换到 root 用户后再运行：$0" >&2
         exit 1
     fi
 }
