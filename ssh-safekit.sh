@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ===== 全局变量 =====
-SAFEKIT_VERSION="1.2.1"
+SAFEKIT_VERSION="1.2.2"
 LOG_FILE="${SSH_SAFEKIT_LOG:-/var/log/ssh-safekit.log}"
 BACKUP_DIR="/etc/ssh/backups"
 BACKUP_KEEP=20
