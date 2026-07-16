@@ -541,8 +541,8 @@ toggle_root_login() {
     echo "  0) 返回"
     echo ""
     local choice
-    read -rp "选择: " choice
-    case "$choice" in
+    read -rp "选择 [0]: " choice
+    case "${choice:-0}" in
         1) apply_sshd_setting "PermitRootLogin" "yes" ;;
         2) apply_sshd_setting "PermitRootLogin" "prohibit-password" ;;
         3)
@@ -570,8 +570,8 @@ toggle_password_auth() {
     echo "  0) 返回"
     echo ""
     local choice
-    read -rp "选择: " choice
-    case "$choice" in
+    read -rp "选择 [0]: " choice
+    case "${choice:-0}" in
         1) apply_sshd_setting "PasswordAuthentication" "yes" ;;
         2)
             local user
@@ -604,8 +604,8 @@ change_ssh_port() {
     echo "  0) 返回"
     echo ""
     local choice new_port
-    read -rp "选择: " choice
-    case "$choice" in
+    read -rp "选择 [0]: " choice
+    case "${choice:-0}" in
         1)
             new_port=$(read_uint "输入新端口 (1024-65535): " "" 1024 65535) || return
             ;;
@@ -741,8 +741,8 @@ menu_ssh_config() {
         echo "  0) 返回主菜单"
         echo ""
         local choice
-        read -rp "选择: " choice
-        case "$choice" in
+        read -rp "选择 [0]: " choice
+        case "${choice:-0}" in
             1) toggle_root_login ;;
             2) toggle_password_auth ;;
             3) change_ssh_port ;;
@@ -894,8 +894,8 @@ menu_ssh_keys() {
         echo "  0) 返回主菜单"
         echo ""
         local choice
-        read -rp "选择: " choice
-        case "$choice" in
+        read -rp "选择 [0]: " choice
+        case "${choice:-0}" in
             1) generate_keypair ;;
             2) import_pubkey ;;
             3) list_authorized_keys ;;
@@ -1024,8 +1024,8 @@ menu_fail2ban() {
         echo "  0) 返回主菜单"
         echo ""
         local choice
-        read -rp "选择: " choice
-        case "$choice" in
+        read -rp "选择 [0]: " choice
+        case "${choice:-0}" in
             1) install_fail2ban ;;
             2) configure_fail2ban_jail ;;
             3) show_fail2ban_status ;;
@@ -1355,8 +1355,8 @@ menu_firewall() {
         echo "  0) 返回主菜单"
         echo ""
         local choice
-        read -rp "选择: " choice
-        case "$choice" in
+        read -rp "选择 [0]: " choice
+        case "${choice:-0}" in
             1) fw_allow_port ;;
             2) fw_deny_port ;;
             3) fw_set_default ;;
@@ -1728,8 +1728,9 @@ restore_backup() {
     echo "  0) 取消"
     echo ""
     local choice
-    read -rp "选择要还原的备份: " choice
-    if [[ "$choice" == "0" || -z "$choice" ]]; then return; fi
+    read -rp "选择要还原的备份 [0]: " choice
+    choice="${choice:-0}"
+    if [[ "$choice" == "0" ]]; then return; fi
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#backups[@]} ]]; then
         log_error "无效选择"
         return
